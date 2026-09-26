@@ -277,6 +277,14 @@ class CheckpointManager:
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            try:
+                conn.execute("ALTER TABLE repo_checkpoints ADD COLUMN commits_count INTEGER DEFAULT 0;")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE telemetry ADD COLUMN commits INTEGER DEFAULT 0;")
+            except Exception:
+                pass
 
     def get_completed_repos(self) -> set:
         with self._get_conn() as conn:
