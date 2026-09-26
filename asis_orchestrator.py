@@ -12,6 +12,12 @@ import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Generator, Tuple
 
+# Force UTF-8 terminal output
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 import mmh3
 import numpy as np
 import pyarrow as pa
@@ -19,12 +25,6 @@ import pyarrow.parquet as pq
 import requests
 import xml.etree.ElementTree as ET
 from fastembed import TextEmbedding
-
-# Force UTF-8 terminal output
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-if hasattr(sys.stderr, 'reconfigure'):
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 # ==============================================================================
 # CONFIGURATION & CONSTANTS
@@ -80,6 +80,18 @@ FILE_SCHEMA = pa.schema([
     ("content_hash", pa.string())
 ])
 
+GIT_SCHEMA = pa.schema([
+    ("commit_sha", pa.string()),
+    ("repo", pa.string()),
+    ("project", pa.string()),
+    ("author", pa.string()),
+    ("date", pa.string()),
+    ("subject", pa.string()),
+    ("body", pa.string()),
+    ("files_changed_count", pa.int32()),
+    ("files_changed", pa.list_(pa.string()))
+])
+
 # ==============================================================================
 # DISK & PROCESS SAFETY UTILITIES
 # ==============================================================================
@@ -94,7 +106,10 @@ def remove_readonly(func, path, exc_info):
 def clean_dir(target_dir: Path):
     if target_dir.exists():
         for _ in range(5):
-            subprocess.run(f'cmd /c rd /s /q "{target_dir}"', shell=True, capture_output=True)
+            if os.name == 'nt':
+                subprocess.run(f'cmd /c rd /s /q "{target_dir}"', shell=True, capture_output=True)
+            else:
+                subprocess.run(f'rm -rf "{target_dir}"', shell=True, capture_output=True)
             if not target_dir.exists():
                 return
             try:
@@ -104,7 +119,6 @@ def clean_dir(target_dir: Path):
             except Exception:
                 pass
             time.sleep(0.5)
-
 
 def get_free_disk_gb(path: Path) -> float:
     total, used, free = shutil.disk_usage(path.anchor if os.name == 'nt' else str(path))
@@ -132,8 +146,11 @@ class ManifestResolver:
 
     def resolve(self) -> List[Dict[str, Any]]:
         if self.cache_file.exists():
-            with open(self.cache_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+            try:
+                with open(self.cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
 
         print("[ASIS] Fetching Evolution-X Android 17 (cnb) manifests...")
         projects: Dict[str, Dict[str, Any]] = {}
@@ -236,6 +253,7 @@ class CheckpointManager:
                     error_msg TEXT,
                     files_count INTEGER DEFAULT 0,
                     chunks_count INTEGER DEFAULT 0,
+                    commits_count INTEGER DEFAULT 0,
                     duration_sec REAL DEFAULT 0,
                     completed_at TIMESTAMP
                 );
@@ -253,6 +271,7 @@ class CheckpointManager:
                     repo_path TEXT NOT NULL,
                     chunks INTEGER NOT NULL,
                     files INTEGER NOT NULL,
+                    commits INTEGER DEFAULT 0,
                     duration_sec REAL NOT NULL,
                     chunks_per_sec REAL NOT NULL,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -272,20 +291,20 @@ class CheckpointManager:
                 ON CONFLICT(repo_path) DO UPDATE SET status = 'IN_PROGRESS', error_msg = NULL
             """, (repo_path, repo_name, clone_url, revision))
 
-    def mark_completed(self, repo_path: str, commit_sha: str, files: int, chunks: int, duration: float):
+    def mark_completed(self, repo_path: str, commit_sha: str, files: int, chunks: int, commits: int, duration: float):
         cps = chunks / max(0.1, duration)
         with self._get_conn() as conn:
             conn.execute("""
                 UPDATE repo_checkpoints
                 SET status = 'COMPLETED', commit_sha = ?, files_count = ?, chunks_count = ?,
-                    duration_sec = ?, completed_at = CURRENT_TIMESTAMP
+                    commits_count = ?, duration_sec = ?, completed_at = CURRENT_TIMESTAMP
                 WHERE repo_path = ?
-            """, (commit_sha, files, chunks, duration, repo_path))
+            """, (commit_sha, files, chunks, commits, duration, repo_path))
 
             conn.execute("""
-                INSERT INTO telemetry (repo_path, chunks, files, duration_sec, chunks_per_sec)
-                VALUES (?, ?, ?, ?, ?)
-            """, (repo_path, chunks, files, duration, cps))
+                INSERT INTO telemetry (repo_path, chunks, files, commits, duration_sec, chunks_per_sec)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (repo_path, chunks, files, commits, duration, cps))
 
     def mark_failed(self, repo_path: str, error_msg: str):
         with self._get_conn() as conn:
@@ -302,6 +321,7 @@ class CheckpointManager:
                     COUNT(*) as completed_count,
                     COALESCE(SUM(files_count), 0) as total_files,
                     COALESCE(SUM(chunks_count), 0) as total_chunks,
+                    COALESCE(SUM(commits_count), 0) as total_commits,
                     COALESCE(SUM(duration_sec), 0) as total_duration
                 FROM repo_checkpoints WHERE status = 'COMPLETED'
             """)
@@ -310,7 +330,8 @@ class CheckpointManager:
                 "completed_count": row[0],
                 "total_files": row[1],
                 "total_chunks": row[2],
-                "total_duration": row[3]
+                "total_commits": row[3],
+                "total_duration": row[4]
             }
 
 class KnowledgeGraphDB:
@@ -360,12 +381,25 @@ class KnowledgeGraphDB:
                     subsystem TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS git_history (
+                    commit_sha TEXT PRIMARY KEY,
+                    repo TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    commit_date TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body TEXT,
+                    files_changed_count INTEGER NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(symbol_name);
                 CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(rel_path);
                 CREATE INDEX IF NOT EXISTS idx_files_subsystem ON files(subsystem);
+                CREATE INDEX IF NOT EXISTS idx_git_author ON git_history(author);
+                CREATE INDEX IF NOT EXISTS idx_git_proj ON git_history(project);
             """)
 
-    def batch_insert(self, files: List[Dict], symbols: List[Dict], modules: List[Dict]):
+    def batch_insert(self, files: List[Dict], symbols: List[Dict], modules: List[Dict], commits: List[Dict]):
         with self._get_conn() as conn:
             if files:
                 conn.executemany("""
@@ -385,9 +419,15 @@ class KnowledgeGraphDB:
                     (module_name, module_type, def_path, subsystem)
                     VALUES (:module_name, :module_type, :def_path, :subsystem)
                 """, modules)
+            if commits:
+                conn.executemany("""
+                    INSERT OR REPLACE INTO git_history
+                    (commit_sha, repo, project, author, commit_date, subject, body, files_changed_count)
+                    VALUES (:commit_sha, :repo, :project, :author, :date, :subject, :body, :files_changed_count)
+                """, commits)
 
 # ==============================================================================
-# SOFT AST CHUNKER & PARSERS
+# SOFT AST CHUNKER & GIT PARSERS
 # ==============================================================================
 
 class SoftASTChunker:
@@ -398,11 +438,8 @@ class SoftASTChunker:
     }
 
     SYMBOL_PATTERNS = [
-        # Functions / methods
         r'(?:public|private|protected|static|inline|virtual|extern)?\s*[\w<>:\[\]]+\s+([A-Za-z0-9_]+)\s*\([^)]*\)\s*\{',
-        # Classes / structs / interfaces
         r'(?:class|struct|interface|enum)\s+([A-Za-z0-9_]+)',
-        # Soong / Make modules
         r'([a-z0-9_]+)\s*\{\s*name:\s*"([^"]+)"',
         r'LOCAL_MODULE\s*:=\s*([A-Za-z0-9_]+)'
     ]
@@ -429,7 +466,7 @@ class SoftASTChunker:
             if path.name.startswith("."):
                 return False
             try:
-                if path.stat().st_size > 800 * 1024:  # Skip files > 800 KB
+                if path.stat().st_size > 800 * 1024:
                     return False
             except OSError:
                 return False
@@ -453,7 +490,6 @@ class SoftASTChunker:
         modules = []
         subsystem = cls.get_subsystem(rel_path)
 
-        # Check for build modules
         if full_path.name in ("Android.bp", "Android.mk") or full_path.suffix == ".mk":
             content = "".join(lines)
             import re
@@ -472,7 +508,6 @@ class SoftASTChunker:
                     "subsystem": subsystem
                 })
 
-        # Soft AST Sliding Window
         target_lines = 60
         max_lines = 100
         overlap = 15
@@ -481,7 +516,6 @@ class SoftASTChunker:
         while start < total_lines:
             end = min(start + target_lines, total_lines)
 
-            # Snap end to closest statement boundary or brace
             snap_window = lines[max(0, end - 8): min(total_lines, end + 8)]
             for offset, line in enumerate(snap_window):
                 stripped = line.strip()
@@ -493,7 +527,6 @@ class SoftASTChunker:
             chunk_text = "".join(chunk_lines).strip()
 
             if chunk_text:
-                # Find symbol in chunk
                 symbol_name = ""
                 symbol_kind = "block"
                 import re
@@ -533,6 +566,44 @@ class SoftASTChunker:
             start = max(start + 1, end - overlap)
 
         return chunks, symbols, modules
+
+    @classmethod
+    def extract_git_commits(cls, repo_dir: Path, repo_path: str) -> List[Dict]:
+        cmd = 'git log --pretty=format:"COMMIT_REC%H%x1f%an%x1f%ad%x1f%s%x1f%b%x1e" --name-only'
+        res = subprocess.run(cmd, cwd=str(repo_dir), shell=True, capture_output=True, text=True, errors="replace")
+        if res.returncode != 0 or not res.stdout:
+            return []
+
+        commits = []
+        records = res.stdout.split("COMMIT_REC")
+        for rec in records:
+            if not rec.strip():
+                continue
+            parts = rec.split("\x1e")
+            meta_part = parts[0]
+            files_part = parts[1] if len(parts) > 1 else ""
+
+            fields = meta_part.split("\x1f")
+            if len(fields) >= 4:
+                sha = fields[0].strip()
+                author = fields[1].strip()
+                date_str = fields[2].strip()
+                subject = fields[3].strip()
+                body = fields[4].strip() if len(fields) > 4 else ""
+                files = [f.strip() for f in files_part.splitlines() if f.strip()]
+
+                commits.append({
+                    "commit_sha": sha,
+                    "repo": "evox",
+                    "project": repo_path,
+                    "author": author,
+                    "date": date_str,
+                    "subject": subject,
+                    "body": body,
+                    "files_changed_count": len(files),
+                    "files_changed": files
+                })
+        return commits
 
 # ==============================================================================
 # HIGH-PRECISION DENSE SHARD WRITER
@@ -635,18 +706,18 @@ class ASISPipeline:
         clean_dir(self.temp_dir)
         branch = revision.replace("refs/heads/", "").replace("refs/tags/", "")
         
-        # 1. Try shallow clone with specified branch and relaxed NTFS protection
-        cmd = f'git clone -c core.protectNTFS=false --depth 1 --single-branch --branch "{branch}" "{clone_url}" "{self.temp_dir}"'
+        # 1. Clone with full branch commits history
+        ntfs_flag = "-c core.protectNTFS=false" if os.name == 'nt' else ""
+        cmd = f'git clone {ntfs_flag} --single-branch --branch "{branch}" "{clone_url}" "{self.temp_dir}"'
         res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-        # 2. Check if clone succeeded despite checkout warnings (e.g. invalid Windows filenames)
         sha_res = subprocess.run('git rev-parse HEAD', cwd=str(self.temp_dir), shell=True, capture_output=True, text=True)
         if sha_res.returncode == 0 and sha_res.stdout.strip():
             return sha_res.stdout.strip()
 
-        # 3. Fallback to default clone if branch not found
+        # 2. Fallback to default clone if specific branch name not found
         clean_dir(self.temp_dir)
-        cmd = f'git clone -c core.protectNTFS=false --depth 1 "{clone_url}" "{self.temp_dir}"'
+        cmd = f'git clone {ntfs_flag} --single-branch "{clone_url}" "{self.temp_dir}"'
         res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         
         sha_res = subprocess.run('git rev-parse HEAD', cwd=str(self.temp_dir), shell=True, capture_output=True, text=True)
@@ -657,7 +728,6 @@ class ASISPipeline:
         raise RuntimeError(f"Git clone failed: {res.stderr.strip()}")
 
     def git_push_data(self, commit_msg: str):
-        # Truncate WAL so databases can be committed cleanly
         try:
             with sqlite3.connect(self.data_dir / "manifest.sqlite") as c:
                 c.execute("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -666,21 +736,18 @@ class ASISPipeline:
         except Exception:
             pass
 
-        cmds = [
-            'git add -A',
-            f'git commit -m "{commit_msg}"',
-            'git push origin asis-data'
-        ]
-        for cmd in cmds:
-            p = subprocess.run(cmd, cwd=str(self.data_dir), shell=True, capture_output=True, text=True)
-            if "nothing to commit" in p.stdout or "nothing to commit" in p.stderr:
-                continue
-            if p.returncode != 0 and "push" in cmd:
-                print(f"[ASIS] Git push warning: {p.stderr.strip()}. Retrying in 3s...")
-                time.sleep(3)
-                subprocess.run('git push origin asis-data', cwd=str(self.data_dir), shell=True)
+        subprocess.run('git add -A', cwd=str(self.data_dir), shell=True, capture_output=True)
+        c_res = subprocess.run(f'git commit -m "{commit_msg}"', cwd=str(self.data_dir), shell=True, capture_output=True, text=True)
+        
+        # Retry push up to 5 times
+        for attempt in range(1, 6):
+            p = subprocess.run('git push origin asis-data', cwd=str(self.data_dir), shell=True, capture_output=True, text=True)
+            if p.returncode == 0:
+                return
+            print(f"[ASIS] Push attempt {attempt}/5 failed: {p.stderr.strip()}. Retrying in {attempt * 3}s...")
+            time.sleep(attempt * 3)
 
-    def process_single_repo(self, repo: Dict[str, Any]) -> Tuple[int, int, float]:
+    def process_single_repo(self, repo: Dict[str, Any]) -> Tuple[int, int, int, float]:
         repo_path = repo["path"]
         repo_name = repo["name"]
         clone_url = repo["clone_url"]
@@ -689,10 +756,13 @@ class ASISPipeline:
         start_time = time.time()
         self.checkpoint.mark_in_progress(repo_path, repo_name, clone_url, revision)
 
-        # 1. Clone repository
+        # 1. Clone repository with full branch commits
         commit_sha = self.git_clone_repo(clone_url, revision)
 
-        # 2. Scan & parse files
+        # 2. Extract Git Commits History
+        all_commits = SoftASTChunker.extract_git_commits(self.temp_dir, repo_path)
+
+        # 3. Scan & parse files
         all_chunks = []
         all_symbols = []
         all_modules = []
@@ -731,46 +801,50 @@ class ASISPipeline:
                     all_symbols.extend(s)
                     all_modules.extend(m)
 
-        # 3. Vectorize chunks with BGE-Large
+        # 4. Vectorize chunks with BGE-Large FP32
         stored_chunks = self.sharder.embed_and_store(all_chunks, repo, commit_sha)
 
-        # 4. Save to Parquet Shards
+        # 5. Save Parquet Shards
+        p_idx = self.sharder.current_shard_idx
         if stored_chunks:
             chunk_table = pa.Table.from_pylist(stored_chunks, schema=CHUNK_SCHEMA)
-            p_idx = self.sharder.current_shard_idx
             pq_chunk_path = self.data_dir / f"chunks-{p_idx:04d}.parquet"
             pq.write_table(chunk_table, pq_chunk_path, compression="ZSTD", compression_level=7)
 
         if file_records:
             file_table = pa.Table.from_pylist(file_records, schema=FILE_SCHEMA)
-            p_idx = self.sharder.current_shard_idx
             pq_file_path = self.data_dir / f"files-{p_idx:04d}.parquet"
             pq.write_table(file_table, pq_file_path, compression="ZSTD", compression_level=7)
 
-        # 5. Populate SQLite Knowledge Graph
-        self.graph.batch_insert(file_records, all_symbols, all_modules)
+        if all_commits:
+            git_table = pa.Table.from_pylist(all_commits, schema=GIT_SCHEMA)
+            pq_git_path = self.data_dir / f"git_history-{p_idx:04d}.parquet"
+            pq.write_table(git_table, pq_git_path, compression="ZSTD", compression_level=7)
 
-        # 6. Delete temp clone directory immediately
+        # 6. Populate SQLite Knowledge Graph
+        self.graph.batch_insert(file_records, all_symbols, all_modules, all_commits)
+
+        # 7. Delete temp clone directory immediately
         clean_dir(self.temp_dir)
 
         duration = time.time() - start_time
-        self.checkpoint.mark_completed(repo_path, commit_sha, len(file_records), len(all_chunks), duration)
+        self.checkpoint.mark_completed(repo_path, commit_sha, len(file_records), len(all_chunks), len(all_commits), duration)
 
-        # 7. Git commit & push
-        commit_msg = f"[ASIS-A17] Ingested {repo_path} ({len(all_chunks)} chunks, {len(file_records)} files)"
+        # 8. Git commit & push
+        commit_msg = f"[ASIS-A17] Ingested {repo_path} ({len(all_chunks)} chunks, {len(file_records)} files, {len(all_commits)} commits)"
         self.git_push_data(commit_msg)
 
-        return len(file_records), len(all_chunks), duration
+        return len(file_records), len(all_chunks), len(all_commits), duration
 
     def run(self, limit: int = None, start_from: str = None):
         projects = self.resolver.resolve()
         completed = self.checkpoint.get_completed_repos()
 
         print("=" * 80)
-        print("  ASIS SEQUENTIAL INGESTION ENGINE — EVOLUTION-X ANDROID 17")
+        print("  ASIS HIGH-PRECISION INGESTION ENGINE — EVOLUTION-X ANDROID 17")
         print(f"  Model: {DEFAULT_MODEL} (1024-dim, Float32)")
         print(f"  Total Repos: {len(projects)} | Already Completed: {len(completed)}")
-        print(f"  Export Worktree: {self.data_dir}")
+        print(f"  Data Target: {self.data_dir} (branch: asis-data)")
         print("=" * 80)
 
         started = False if start_from else True
@@ -792,13 +866,11 @@ class ASISPipeline:
                 print(f"[ASIS] Reached session limit of {limit} repos. Halting cleanly.")
                 break
 
-            # Check Free Disk Space
             free_gb = get_free_disk_gb(self.data_dir)
             if free_gb < MIN_FREE_DISK_GB:
                 print(f"\n[ASIS CRITICAL] Free disk space low: {free_gb:.2f} GB (< {MIN_FREE_DISK_GB} GB). Stopping to avoid out-of-disk error!")
                 break
 
-            # Telemetry & ETA
             stats = self.checkpoint.get_aggregate_stats()
             total_completed = stats["completed_count"]
             progress_pct = (total_completed / len(projects)) * 100
@@ -810,9 +882,9 @@ class ASISPipeline:
                   f"Syncing: {repo_path} | Overall ETA: {format_duration(overall_eta_sec)} | Free Disk: {free_gb:.1f}GB")
 
             try:
-                files_cnt, chunks_cnt, dur = self.process_single_repo(repo)
+                files_cnt, chunks_cnt, commits_cnt, dur = self.process_single_repo(repo)
                 cps = chunks_cnt / max(0.1, dur)
-                print(f"  [+] Ingested: {files_cnt} files, {chunks_cnt} chunks in {dur:.1f}s ({cps:.1f} chunks/s) -> Pushed to Git & Deleted")
+                print(f"  [+] Ingested: {files_cnt} files, {chunks_cnt} chunks, {commits_cnt} commits in {dur:.1f}s ({cps:.1f} chunks/s) -> Pushed & Deleted")
                 processed_in_session += 1
             except Exception as e:
                 print(f"  [-] Error processing {repo_path}: {e}")
@@ -841,6 +913,6 @@ if __name__ == "__main__":
         total_p = len(projects)
         comp = stats["completed_count"]
         pct = (comp / total_p) * 100 if total_p else 0
-        print(f"ASIS Status: {comp}/{total_p} repos ({pct:.2f}%) | {stats['total_files']} files | {stats['total_chunks']} chunks | Shards: {pipeline.sharder.current_shard_idx + 1}")
+        print(f"ASIS Status: {comp}/{total_p} repos ({pct:.2f}%) | {stats['total_files']} files | {stats['total_chunks']} chunks | {stats['total_commits']} commits | Shards: {pipeline.sharder.current_shard_idx + 1}")
     else:
         pipeline.run(limit=args.limit, start_from=args.start_from)
