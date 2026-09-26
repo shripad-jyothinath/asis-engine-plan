@@ -20,6 +20,12 @@ import requests
 import xml.etree.ElementTree as ET
 from fastembed import TextEmbedding
 
+# Force UTF-8 terminal output
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 # ==============================================================================
 # CONFIGURATION & CONSTANTS
 # ==============================================================================
@@ -79,19 +85,26 @@ FILE_SCHEMA = pa.schema([
 # ==============================================================================
 
 def remove_readonly(func, path, exc_info):
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass
 
 def clean_dir(target_dir: Path):
     if target_dir.exists():
-        for _ in range(3):
+        for _ in range(5):
+            subprocess.run(f'cmd /c rd /s /q "{target_dir}"', shell=True, capture_output=True)
+            if not target_dir.exists():
+                return
             try:
                 shutil.rmtree(target_dir, onerror=remove_readonly)
-                break
-            except Exception as e:
-                time.sleep(1)
-        if target_dir.exists():
-            subprocess.run(f'cmd /c rd /s /q "{target_dir}"', shell=True, capture_output=True)
+                if not target_dir.exists():
+                    return
+            except Exception:
+                pass
+            time.sleep(0.5)
+
 
 def get_free_disk_gb(path: Path) -> float:
     total, used, free = shutil.disk_usage(path.anchor if os.name == 'nt' else str(path))
@@ -622,26 +635,41 @@ class ASISPipeline:
         clean_dir(self.temp_dir)
         branch = revision.replace("refs/heads/", "").replace("refs/tags/", "")
         
-        # 1. Try shallow clone with specified branch
-        cmd = f'git clone --depth 1 --single-branch --branch "{branch}" "{clone_url}" "{self.temp_dir}"'
+        # 1. Try shallow clone with specified branch and relaxed NTFS protection
+        cmd = f'git clone -c core.protectNTFS=false --depth 1 --single-branch --branch "{branch}" "{clone_url}" "{self.temp_dir}"'
         res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-        # 2. Fallback to default clone if branch not found
-        if res.returncode != 0:
-            cmd = f'git clone --depth 1 "{clone_url}" "{self.temp_dir}"'
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            if res.returncode != 0:
-                raise RuntimeError(f"Git clone failed: {res.stderr.strip()}")
-
-        # Extract commit sha
+        # 2. Check if clone succeeded despite checkout warnings (e.g. invalid Windows filenames)
         sha_res = subprocess.run('git rev-parse HEAD', cwd=str(self.temp_dir), shell=True, capture_output=True, text=True)
-        return sha_res.stdout.strip() if sha_res.returncode == 0 else "unknown"
+        if sha_res.returncode == 0 and sha_res.stdout.strip():
+            return sha_res.stdout.strip()
+
+        # 3. Fallback to default clone if branch not found
+        clean_dir(self.temp_dir)
+        cmd = f'git clone -c core.protectNTFS=false --depth 1 "{clone_url}" "{self.temp_dir}"'
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        sha_res = subprocess.run('git rev-parse HEAD', cwd=str(self.temp_dir), shell=True, capture_output=True, text=True)
+        if sha_res.returncode == 0 and sha_res.stdout.strip():
+            return sha_res.stdout.strip()
+
+        clean_dir(self.temp_dir)
+        raise RuntimeError(f"Git clone failed: {res.stderr.strip()}")
 
     def git_push_data(self, commit_msg: str):
+        # Truncate WAL so databases can be committed cleanly
+        try:
+            with sqlite3.connect(self.data_dir / "manifest.sqlite") as c:
+                c.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            with sqlite3.connect(self.data_dir / "asis_graph.db") as c:
+                c.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except Exception:
+            pass
+
         cmds = [
-            f'git add manifest.sqlite asis_graph.db chunks-*.parquet files-*.parquet embeddings/',
+            'git add -A',
             f'git commit -m "{commit_msg}"',
-            f'git push origin asis-data'
+            'git push origin asis-data'
         ]
         for cmd in cmds:
             p = subprocess.run(cmd, cwd=str(self.data_dir), shell=True, capture_output=True, text=True)
@@ -784,10 +812,10 @@ class ASISPipeline:
             try:
                 files_cnt, chunks_cnt, dur = self.process_single_repo(repo)
                 cps = chunks_cnt / max(0.1, dur)
-                print(f"  ✓ Ingested: {files_cnt} files, {chunks_cnt} chunks in {dur:.1f}s ({cps:.1f} chunks/s) -> Pushed to Git & Deleted")
+                print(f"  [+] Ingested: {files_cnt} files, {chunks_cnt} chunks in {dur:.1f}s ({cps:.1f} chunks/s) -> Pushed to Git & Deleted")
                 processed_in_session += 1
             except Exception as e:
-                print(f"  ✗ Error processing {repo_path}: {e}")
+                print(f"  [-] Error processing {repo_path}: {e}")
                 self.checkpoint.mark_failed(repo_path, str(e))
                 clean_dir(self.temp_dir)
 
