@@ -18,6 +18,11 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
+# Hardware Concurrency & NUMA Tuning for 2-core EPYC Zen 4
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+os.environ["ONNXRUNTIME_NUM_THREADS"] = "2"
+
 import mmh3
 import numpy as np
 import pyarrow as pa
@@ -43,7 +48,7 @@ DATA_DIR = (BASE_DIR.parent / "asis-data-export").resolve()
 TEMP_CLONE_DIR = (BASE_DIR.parent / "asis-temp-repo").resolve()
 
 SHARD_CHUNK_LIMIT = 5000
-EMBEDDING_BATCH_SIZE = 16
+EMBEDDING_BATCH_SIZE = 32
 MIN_FREE_DISK_GB = 3.5
 
 CHUNK_SCHEMA = pa.schema([
@@ -238,6 +243,9 @@ class CheckpointManager:
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.execute("PRAGMA temp_store = MEMORY;")
+        conn.execute("PRAGMA cache_size = -64000;")
+        conn.execute("PRAGMA mmap_size = 2147483648;")
         return conn
 
     def _init_db(self):
@@ -351,6 +359,9 @@ class KnowledgeGraphDB:
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.execute("PRAGMA temp_store = MEMORY;")
+        conn.execute("PRAGMA cache_size = -64000;")
+        conn.execute("PRAGMA mmap_size = 2147483648;")
         return conn
 
     def _init_db(self):
@@ -623,8 +634,8 @@ class ShardWriter:
         self.dense_dir = export_dir / "embeddings" / "dense"
         self.dense_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"[ASIS] Initializing FastEmbed model: {model_name}...")
-        self.model = TextEmbedding(model_name=model_name)
+        print(f"[ASIS] Initializing FastEmbed model: {model_name} (threads=2)...")
+        self.model = TextEmbedding(model_name=model_name, threads=2)
         self.current_shard_idx = self._find_latest_shard_index()
         self.current_shard_chunks = 0
         self.shard_bin_file = None
@@ -714,20 +725,31 @@ class ASISPipeline:
         clean_dir(self.temp_dir)
         branch = revision.replace("refs/heads/", "").replace("refs/tags/", "")
         
-        # 1. Clone with full branch commits history
+        # 1. Blobless clone with full commit history:
+        # Fetches 100% of commit trees/history for git log extraction, but only downloads HEAD files.
+        # Accelerates git clone by 5-10x and avoids gigabytes of dead binary history!
         ntfs_flag = "-c core.protectNTFS=false" if os.name == 'nt' else ""
-        cmd = f'git clone {ntfs_flag} --single-branch --branch "{branch}" "{clone_url}" "{self.temp_dir}"'
+        cmd = f'git clone {ntfs_flag} --filter=blob:none --no-tags --single-branch --branch "{branch}" "{clone_url}" "{self.temp_dir}"'
         res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
         sha_res = subprocess.run('git rev-parse HEAD', cwd=str(self.temp_dir), shell=True, capture_output=True, text=True)
         if sha_res.returncode == 0 and sha_res.stdout.strip():
             return sha_res.stdout.strip()
 
-        # 2. Fallback to default clone if specific branch name not found
+        # 2. Fallback without specific branch
+        clean_dir(self.temp_dir)
+        cmd = f'git clone {ntfs_flag} --filter=blob:none --no-tags --single-branch "{clone_url}" "{self.temp_dir}"'
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+        sha_res = subprocess.run('git rev-parse HEAD', cwd=str(self.temp_dir), shell=True, capture_output=True, text=True)
+        if sha_res.returncode == 0 and sha_res.stdout.strip():
+            return sha_res.stdout.strip()
+
+        # 3. Fallback without blobless filter if git server does not support partial clone
         clean_dir(self.temp_dir)
         cmd = f'git clone {ntfs_flag} --single-branch "{clone_url}" "{self.temp_dir}"'
         res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        
+
         sha_res = subprocess.run('git rev-parse HEAD', cwd=str(self.temp_dir), shell=True, capture_output=True, text=True)
         if sha_res.returncode == 0 and sha_res.stdout.strip():
             return sha_res.stdout.strip()
@@ -817,17 +839,17 @@ class ASISPipeline:
         if stored_chunks:
             chunk_table = pa.Table.from_pylist(stored_chunks, schema=CHUNK_SCHEMA)
             pq_chunk_path = self.data_dir / f"chunks-{p_idx:04d}.parquet"
-            pq.write_table(chunk_table, pq_chunk_path, compression="ZSTD", compression_level=7)
+            pq.write_table(chunk_table, pq_chunk_path, compression="ZSTD", compression_level=3)
 
         if file_records:
             file_table = pa.Table.from_pylist(file_records, schema=FILE_SCHEMA)
             pq_file_path = self.data_dir / f"files-{p_idx:04d}.parquet"
-            pq.write_table(file_table, pq_file_path, compression="ZSTD", compression_level=7)
+            pq.write_table(file_table, pq_file_path, compression="ZSTD", compression_level=3)
 
         if all_commits:
             git_table = pa.Table.from_pylist(all_commits, schema=GIT_SCHEMA)
             pq_git_path = self.data_dir / f"git_history-{p_idx:04d}.parquet"
-            pq.write_table(git_table, pq_git_path, compression="ZSTD", compression_level=7)
+            pq.write_table(git_table, pq_git_path, compression="ZSTD", compression_level=3)
 
         # 6. Populate SQLite Knowledge Graph
         self.graph.batch_insert(file_records, all_symbols, all_modules, all_commits)
