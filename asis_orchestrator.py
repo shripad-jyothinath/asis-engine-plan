@@ -1107,6 +1107,7 @@ class ASISPipeline:
             gi_rules = "*.db-shm\n*.db-wal\n*.sqlite-shm\n*.sqlite-wal\n.staging_*.bin\nasis_graph.db\n"
             if not gitignore_path.exists() or gitignore_path.read_text(encoding="utf-8") != gi_rules:
                 gitignore_path.write_text(gi_rules, encoding="utf-8")
+            subprocess.run('git rm --cached -f asis_graph.db asis_graph.db-shm asis_graph.db-wal manifest.sqlite-shm manifest.sqlite-wal 2>/dev/null', cwd=str(self.data_dir), shell=True, capture_output=True)
 
             # Fast gzip snapshot of asis_graph.db for Git (8x compression keeps it << 100 MB)
             db_path = self.data_dir / "asis_graph.db"
