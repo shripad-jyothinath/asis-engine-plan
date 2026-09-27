@@ -1,0 +1,12 @@
+{
+  "pipeline_version": "a17-prod-v2",
+  "chunker_version": "heuristic-v2",
+  "embedding_model": "BAAI/bge-large-en-v1.5",
+  "embedding_dimension": 1024,
+  "precision": "float16",
+  "bytes_per_vector": 2048,
+  "shard_chunk_limit": 5000,
+  "min_free_disk_gb": 100.0,
+  "max_git_commits": 1000,
+  "max_git_diff_kb": 15
+}
