@@ -280,35 +280,22 @@ git_schema = pa.schema([
 
 ## 3. Core Algorithms & Logic
 
-### 3.1 Soft AST Boundary Chunker
+### 3.1 Heuristic Syntactic & Boundary Chunker
 
 ```text
-Algorithm: SoftASTChunk(file_content, lang, target_lines=60, max_lines=120, overlap=15)
----------------------------------------------------------------------------------------
-Input:  file_content (string), lang (enum: C, CPP, JAVA, KOTLIN, RUST, DTS, SHELL)
+Algorithm: HeuristicSyntacticChunk(file_content, lang, target_lines=80, overlap=12)
+-------------------------------------------------------------------------------------
+Input:  file_content (string), lang (enum: C, CPP, JAVA, KOTLIN, RUST, DTS, SHELL, GO)
 Output: List of Chunks {start_line, end_line, symbol, text, symbol_kind}
 
-1. Parse file_content using tree-sitter or regex fallback to produce AST nodes.
-2. Extract all top-level symbols S = {Node_i | Node_i is Function, Class, Struct, or Interface}.
-3. chunks = []
-4. For each node s in S:
-     length = s.end_line - s.start_line + 1
-     if length <= max_lines:
-         // Case A: Atomic preservation
-         chunks.append(CreateChunk(s.start_line, s.end_line, s.name, s.kind, s.text))
-     else:
-         // Case B: Split over-sized function at statement / block boundaries
-         curr_start = s.start_line
-         while curr_start <= s.end_line:
-             curr_end = min(curr_start + target_lines, s.end_line)
-             // Snap curr_end to nearest statement boundary (';' or '}')
-             curr_end = FindNearestStatementBoundary(file_content, curr_end, window=10)
-             chunks.append(CreateChunk(curr_start, curr_end, s.name, s.kind, ...))
-             if curr_end >= s.end_line: break
-             curr_start = curr_end - overlap
-5. For uncovered regions (comments, headers, top-level globals):
-     Collect remaining line intervals and split using sliding window (target_lines, overlap).
-6. Return chunks sorted by start_line.
+1. Target size calibrated to ~250–300 tokens (target_lines=80) to maximize semantic density.
+2. For each window [curr_start, curr_start + target_lines]:
+     Search backwards/forwards for nearest statement delimiter ('}' or ';') to snap chunk boundary.
+3. Monotonic Progression Guarantee:
+     Enforce next_start = end - 12 (if end - 12 > curr_start) else end.
+     curr_start = max(curr_start + 1, next_start) to strictly prevent zero-advance stalls.
+4. Extract structural symbols (functions, classes, structs, build modules) from snapped boundaries.
+5. Return enriched chunks and structural symbol definitions.
 ```
 
 ### 3.2 Dual Hashing & Incremental Manifest Algorithm
@@ -575,8 +562,23 @@ Each tool is exposed as an atomic function callable by DeepSeek / Claude / GPT a
   - `query_asis.py find_definition getDisplay`: Returns exact line ranges (`HardwareRenderer.java:1666-1725`) in <100ms.
   - `query_asis.py read_source ...`: Line-exact code window retrieval verified.
   - `query_asis.py search "window manager display"`: Dense multi-shard cosine similarity retrieval verified across `shard-0000` and `shard-0001` with zero pandas dependencies.
-- **Estimated Full Tree Duration**:
-  - Entire AOSP tree (~1.6M files) contains ~2.5M–3.5M chunkable code segments.
-  - At our calibrated sustained rate of **53.8 chunks/sec**, full ingestion completes in ~14–18 hours.
-  - Shards are committed every 5,000 files, making the intelligence database progressively queryable in real time during the run.
+### Milestone 6: Evolution-X Android 17 Sequential GPU Pipeline (`asis_orchestrator.py`)
+- **System Target**: 1,257 Evolution-X Android 17 repositories dynamically resolved from official manifests (`cnb` branch).
+- **Target Hardware**: NVIDIA Tesla T4 GPU (16 GB VRAM), 16 GB system RAM, 9 GB swap, 200 GB NVMe storage.
+- **Hardware-Calibrated Vector Acceleration**:
+  - Model: `BAAI/bge-large-en-v1.5` (1024-dimension, FP16).
+  - Switched from CPU-bound ONNX FP32 to native PyTorch `SentenceTransformer` with `model.half()`, engaging T4 Tensor Cores.
+  - Achieved **51.2 chunks/s sustained throughput** on live heterogeneous code trees (up from 11.6 chunks/s — a **4.4x speedup**) with 100% GPU utilization and only 2.5 GB VRAM.
+- **Strict Multi-Shard Slicing (<10.24 MB per Shard)**:
+  - Streaming slice rotation in `commit_staged_vectors` strictly enforces `SHARD_CHUNK_LIMIT = 5000` vectors (10.24 MB).
+  - Massive repositories (e.g., `cts` with 71,358 chunks) automatically slice across multiple consecutive shards (`shard-0001.bin`, `shard-0002.bin`, etc.), guaranteeing no single file ever breaches GitHub's 100 MB limit (GH001).
+  - Parquet chunks are grouped 1:1 by shard index (`chunks-XXXX.parquet`).
+- **Crash Consistency & Atomic Staging**:
+  - Embeddings are written to `.staging_<run_id>.bin` buffers and count-validated before being committed to binary shards and Parquet tables.
+  - Automated startup recovery truncates uncommitted shard tails and purges orphan staging files.
+- **Git Remote Publishing & Knowledge Graph Protection**:
+  - Automatic `asis_graph.db.gz` fast compression (8x ratio) and `.gitignore` exclusion of raw WAL/DB files guarantees GitHub push compliance across the multi-gigabyte corpus.
+  - Transparent auto-decompression fallback integrated into `query_asis.py`.
+- **Bounded Git Causality Extraction**:
+  - Full non-shallow clones capturing up to 1,000 commits per repository with a 15 KB diff cap per commit and 10 MB total diff budget per repo.
 
