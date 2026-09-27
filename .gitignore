@@ -1,0 +1,6 @@
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+.staging_*.bin
+asis_graph.db
