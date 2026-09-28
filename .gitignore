@@ -4,3 +4,4 @@
 *.sqlite-wal
 .staging_*.bin
 asis_graph.db
+asis_graph.db.gz
