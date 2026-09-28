@@ -15,11 +15,18 @@ MODEL_NAME = "BAAI/bge-large-en-v1.5"
 def get_graph_db():
     db_path = DATA_DIR / "asis_graph.db"
     gz_path = DATA_DIR / "asis_graph.db.gz"
-    if not db_path.exists() and gz_path.exists():
+    parts = sorted(DATA_DIR.glob("asis_graph.db.gz.part*"))
+    if not db_path.exists():
         import gzip
         import shutil
-        with gzip.open(gz_path, "rb") as f_in, open(db_path, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
+        if parts:
+            with open(gz_path, "wb") as f_out:
+                for p in parts:
+                    with open(p, "rb") as f_in:
+                        shutil.copyfileobj(f_in, f_out)
+        if gz_path.exists():
+            with gzip.open(gz_path, "rb") as f_in, open(db_path, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
     if not db_path.exists():
         print(f"Error: Knowledge graph not found at {db_path}")
         sys.exit(1)

@@ -138,7 +138,7 @@ GIT_SCHEMA = pa.schema([
 
 def remove_readonly(func, path, exc_info):
     try:
-        os.chmod(path, stat.S_IWRITE)
+        os.chmod(path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
         func(path)
     except Exception:
         pass
@@ -1102,19 +1102,37 @@ class ASISPipeline:
             with sqlite3.connect(self.data_dir / "asis_graph.db") as c:
                 c.execute("PRAGMA wal_checkpoint(TRUNCATE);")
 
-            # Ensure .gitignore keeps large raw db and wal files out of git to avoid breaking GitHub 100MB limit
+            # Ensure .gitignore keeps large raw db, wal files, and monolithic gz out of git
             gitignore_path = self.data_dir / ".gitignore"
-            gi_rules = "*.db-shm\n*.db-wal\n*.sqlite-shm\n*.sqlite-wal\n.staging_*.bin\nasis_graph.db\n"
+            gi_rules = "*.db-shm\n*.db-wal\n*.sqlite-shm\n*.sqlite-wal\n.staging_*.bin\nasis_graph.db\nasis_graph.db.gz\n"
             if not gitignore_path.exists() or gitignore_path.read_text(encoding="utf-8") != gi_rules:
                 gitignore_path.write_text(gi_rules, encoding="utf-8")
-            subprocess.run('git rm --cached -f asis_graph.db asis_graph.db-shm asis_graph.db-wal manifest.sqlite-shm manifest.sqlite-wal 2>/dev/null', cwd=str(self.data_dir), shell=True, capture_output=True)
+            subprocess.run('git rm --cached -f asis_graph.db asis_graph.db.gz asis_graph.db-shm asis_graph.db-wal manifest.sqlite-shm manifest.sqlite-wal 2>/dev/null', cwd=str(self.data_dir), shell=True, capture_output=True)
 
-            # Fast gzip snapshot of asis_graph.db for Git (8x compression keeps it << 100 MB)
+            # Multi-part chunked snapshot of asis_graph.db for Git (each part <= 45 MB to stay safely below GitHub 100MB limit)
             db_path = self.data_dir / "asis_graph.db"
             gz_path = self.data_dir / "asis_graph.db.gz"
             if db_path.exists():
                 with open(db_path, "rb") as f_in, gzip.open(gz_path, "wb", compresslevel=1) as f_out:
                     shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
+                
+                # Split gz into <= 45 MB parts
+                PART_SIZE = 45 * 1024 * 1024
+                for old_p in self.data_dir.glob("asis_graph.db.gz.part*"):
+                    try:
+                        old_p.unlink()
+                    except Exception:
+                        pass
+                part_idx = 0
+                with open(gz_path, "rb") as f_in:
+                    while True:
+                        block = f_in.read(PART_SIZE)
+                        if not block:
+                            break
+                        part_file = self.data_dir / f"asis_graph.db.gz.part{part_idx:02d}"
+                        with open(part_file, "wb") as pf:
+                            pf.write(block)
+                        part_idx += 1
         except Exception:
             pass
 
@@ -1337,7 +1355,7 @@ class ASISPipeline:
             remaining_repos = len(projects) - total_completed
             overall_eta_sec = remaining_repos * avg_duration
 
-            print(f"\n[{total_completed + 1} / {len(projects)}] ({progress_pct:.1f}%) "
+            print(f"\n[{idx + 1} / {len(projects)}] (Completed: {total_completed}, {progress_pct:.1f}%) "
                   f"Syncing: {repo_path} | Overall ETA: {format_duration(overall_eta_sec)} | Free Disk: {free_gb:.1f}GB", flush=True)
 
             try:
