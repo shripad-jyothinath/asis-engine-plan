@@ -6,7 +6,7 @@
   "precision": "float16",
   "bytes_per_vector": 2048,
   "shard_chunk_limit": 5000,
-  "min_free_disk_gb": 100.0,
+  "min_free_disk_gb": 15.0,
   "max_git_commits": 1000,
   "max_git_diff_kb": 15
 }
